@@ -8,6 +8,7 @@ import subprocess
 import shutil
 import re
 import threading
+import math
 from datetime import datetime, timedelta, timezone
 from collections import deque
 
@@ -28,10 +29,26 @@ def main():
         help="Rate to feed multimon-ng (Hz), default 22050 for EAS decoding"
     )
     ap.add_argument("--outdir", default=".", help="Where to write WAV files")
-    ap.add_argument("--max-seconds", type=int, default=300, help="Max record length (seconds)")
+    ap.add_argument("--max-seconds", type=int, default=120, help="Max record length (seconds)")
     ap.add_argument("--prefix", help="Filename prefix")
     ap.add_argument("--mp3", action="store_true", help="Save recordings as MP3 (192 kbps CBR)")
     ap.add_argument("--local-time", action="store_true", help="Use system local time in filenames")
+    ap.add_argument(
+        "--reconstruct-same",
+        action="store_true",
+        help="Rebuild SAME header/EOM audio around the captured alert body"
+    )
+    ap.add_argument(
+        "--tone",
+        choices=["ebs", "nwr", "none"],
+        default="none",
+        help="Optional attention tone to synthesize in reconstruction mode"
+    )
+    ap.add_argument(
+        "--tone-duration",
+        type=float,
+        help="Attention tone duration in seconds for reconstruction mode (default 10, range 8-25)"
+    )
     ap.add_argument(
         "--year",
         type=int,
@@ -46,6 +63,15 @@ def main():
     current_year = now_for_year.year
     if args.year is not None and (args.year < 1997 or args.year > current_year):
         ap.error(f"--year must be between 1997 and {current_year}")
+    if args.reconstruct_same and (args.pre_seconds != 0.0 or args.post_seconds != 0.0):
+        ap.error("--pre-seconds and --post-seconds cannot be used with --reconstruct-same")
+    if not args.reconstruct_same and (args.tone != "none" or args.tone_duration is not None):
+        ap.error("--tone and --tone-duration require --reconstruct-same")
+    if args.tone == "none" and args.tone_duration is not None:
+        ap.error("--tone-duration requires --tone ebs or --tone nwr")
+    tone_duration = 10.0 if args.tone_duration is None else args.tone_duration
+    if args.tone != "none" and not (8.0 <= tone_duration <= 25.0):
+        ap.error("--tone-duration must be between 8 and 25 seconds")
     name_year = args.year if args.year is not None else current_year
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -93,6 +119,11 @@ def main():
     rec_bytes = 0
     post_remaining = None
     post_written = 0
+    capture_skip_bytes = 0
+    capture_live_audio = False
+    record_buf = bytearray()
+    decode_pace_start = None
+    decode_pace_bytes = 0
     mp3_threads = []
     log_out = sys.stderr if args.stdout else sys.stdout
     pre_seconds = max(0.0, min(10.0, args.pre_seconds))
@@ -102,6 +133,11 @@ def main():
     max_bytes = int(max(0, args.max_seconds) * args.rate * 2)
     pre_buf = deque()
     pre_buf_bytes = 0
+    bytes_per_second = args.rate * 2
+    capture_delay_seconds = 10.0
+    capture_delay_bytes = int(round(capture_delay_seconds * bytes_per_second))
+    trim_tail_bytes = bytes_per_second + 16000
+    decode_pace_slack_seconds = 0.25
 
     def log(msg: str):
         print(msg, file=log_out, flush=True)
@@ -135,32 +171,109 @@ def main():
                 pass
         return event, date_str, time_str, tz_str
 
-    def start_record(header_line: str, allow_prerec: bool = True):
-        nonlocal recording, wav, rec_start, cur_path, post_remaining, pre_buf_bytes, rec_bytes, post_written
+    def build_output_path(header_line: str):
         event, date_str, time_str, tz_str = parse_event_and_timestamp(header_line)
         if args.prefix:
             base = f"{args.prefix}-{event}-{date_str}-{time_str}{tz_str}"
         else:
             base = f"{event}-{date_str}-{time_str}{tz_str}"
-        wav_name = f"{base}.wav"
-        path = os.path.join(args.outdir, wav_name)
+        return os.path.join(args.outdir, f"{base}.wav")
+
+    def open_output_wav(header_line: str):
+        nonlocal cur_path
+        path = build_output_path(header_line)
         cur_path = path
-
-        wav = wave.open(path, "wb")
-        wav.setnchannels(1)
-        wav.setsampwidth(2)  # s16le
-        wav.setframerate(args.rate)  # ORIGINAL rate
-        recording = True
-        rec_start = time.monotonic()
-        rec_bytes = 0
-        post_remaining = None
-        post_written = 0
-
+        out = wave.open(path, "wb")
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(args.rate)
         log(f"[same] START: {header_line}")
         if args.mp3:
             log(f"[same] Writing temp WAV: {path}")
         else:
             log(f"[same] Writing: {path}")
+        return out
+
+    def silence_bytes(seconds: float):
+        return b"\x00\x00" * max(0, int(round(seconds * args.rate)))
+
+    def tone_bytes(freqs, seconds: float, amplitude: float = 0.8):
+        sample_count = max(0, int(round(seconds * args.rate)))
+        out = bytearray()
+        scale = 32767.0 * amplitude / max(1, len(freqs))
+        phases = [0.0 for _ in freqs]
+        steps = [(2.0 * math.pi * freq) / args.rate for freq in freqs]
+        for _ in range(sample_count):
+            sample = 0.0
+            for idx, step in enumerate(steps):
+                sample += math.sin(phases[idx])
+                phases[idx] += step
+                if phases[idx] >= 2.0 * math.pi:
+                    phases[idx] -= 2.0 * math.pi
+            value = max(-32767, min(32767, int(sample * scale)))
+            out.extend(value.to_bytes(2, "little", signed=True))
+        return bytes(out)
+
+    def same_burst_bytes(payload: str):
+        out = bytearray()
+        phase = 0.0
+        mark_step = (2.0 * math.pi * 2083.3) / args.rate
+        space_step = (2.0 * math.pi * 1562.5) / args.rate
+        samples_per_bit = args.rate / 520.83
+        sample_cursor = 0
+        sample_target = 0.0
+        for byte in ([0xAB] * 16) + [ord(ch) & 0x7F for ch in payload]:
+            for bit_idx in range(8):
+                sample_target += samples_per_bit
+                bit_samples = int(round(sample_target)) - sample_cursor
+                sample_cursor += bit_samples
+                step = mark_step if ((byte >> bit_idx) & 1) else space_step
+                for _ in range(bit_samples):
+                    value = int(24000 * math.sin(phase))
+                    out.extend(value.to_bytes(2, "little", signed=True))
+                    phase += step
+                    if phase >= 2.0 * math.pi:
+                        phase -= 2.0 * math.pi
+        return bytes(out)
+
+    def reconstructed_prefix_bytes(header_line: str):
+        gap = silence_bytes(1.0)
+        burst = same_burst_bytes(header_line)
+        out = bytearray()
+        out.extend(burst)
+        out.extend(gap)
+        out.extend(burst)
+        out.extend(gap)
+        out.extend(burst)
+        out.extend(gap)
+        if args.tone == "ebs":
+            out.extend(tone_bytes([853.0, 960.0], tone_duration, amplitude=0.7))
+            out.extend(gap)
+        elif args.tone == "nwr":
+            out.extend(tone_bytes([1050.0], tone_duration, amplitude=0.8))
+            out.extend(gap)
+        return bytes(out)
+
+    def reconstructed_suffix_bytes():
+        gap = silence_bytes(1.0)
+        burst = same_burst_bytes("NNNN")
+        out = bytearray()
+        out.extend(gap)
+        out.extend(burst)
+        out.extend(gap)
+        out.extend(burst)
+        out.extend(gap)
+        out.extend(burst)
+        return bytes(out)
+
+    def start_record(header_line: str, allow_prerec: bool = True):
+        nonlocal recording, wav, rec_start, cur_path, post_remaining, pre_buf_bytes, rec_bytes, post_written
+        wav = open_output_wav(header_line)
+        recording = True
+        rec_start = time.monotonic()
+        rec_bytes = 0
+        post_remaining = None
+        post_written = 0
 
         if allow_prerec and pre_bytes > 0 and pre_buf_bytes > 0:
             pre_audio = b"".join(pre_buf)
@@ -169,6 +282,26 @@ def main():
                 wav.writeframes(pre_audio[-take:])
                 pre_seconds_actual = take / (args.rate * 2)
                 log(f"[same] Prepend: {take} bytes (~{pre_seconds_actual:.2f}s)")
+        pre_buf.clear()
+        pre_buf_bytes = 0
+
+    def start_reconstructed_record(header_line: str):
+        nonlocal recording, wav, rec_start, rec_bytes, post_remaining, post_written
+        nonlocal capture_skip_bytes, capture_live_audio, record_buf, pre_buf_bytes
+        nonlocal decode_pace_start, decode_pace_bytes
+        wav = open_output_wav(header_line)
+        recording = True
+        rec_start = time.monotonic()
+        rec_bytes = 0
+        post_remaining = None
+        post_written = 0
+        capture_skip_bytes = capture_delay_bytes
+        capture_live_audio = False
+        record_buf = bytearray()
+        decode_pace_start = time.monotonic()
+        decode_pace_bytes = 0
+        wav.writeframes(reconstructed_prefix_bytes(header_line))
+        log(f"[same] Reconstructing SAME header, live capture begins in {capture_delay_seconds:.0f}s")
         pre_buf.clear()
         pre_buf_bytes = 0
 
@@ -200,8 +333,45 @@ def main():
         except Exception:
             log("[same] MP3 conversion failed; keeping WAV.")
 
-    def stop_record(reason: str):
+    def stop_record(reason: str, saw_eom: bool = False):
         nonlocal recording, wav, cur_path, post_remaining, post_written
+        nonlocal capture_skip_bytes, capture_live_audio, record_buf
+        nonlocal decode_pace_start, decode_pace_bytes
+        if args.reconstruct_same and wav is not None:
+            trim_bytes = 0
+            if saw_eom and record_buf:
+                trim_bytes = min(len(record_buf), trim_tail_bytes)
+            live_audio = bytes(record_buf[:-trim_bytes] if trim_bytes else record_buf)
+            try:
+                if live_audio:
+                    wav.writeframes(live_audio)
+                wav.writeframes(reconstructed_suffix_bytes())
+                wav.close()
+            except Exception:
+                try:
+                    wav.close()
+                except Exception:
+                    pass
+            wav = None
+            recording = False
+            post_remaining = None
+            capture_skip_bytes = 0
+            capture_live_audio = False
+            record_buf = bytearray()
+            decode_pace_start = None
+            decode_pace_bytes = 0
+            log(f"[same] STOP: {reason}")
+            if trim_bytes > 0:
+                trim_seconds_actual = trim_bytes / bytes_per_second
+                log(f"[same] Trimmed: {trim_bytes} bytes (~{trim_seconds_actual:.2f}s)")
+            if args.mp3 and cur_path:
+                wav_path = cur_path
+                cur_path = None
+                t_mp3 = threading.Thread(target=convert_to_mp3, args=(wav_path,), daemon=True)
+                mp3_threads.append(t_mp3)
+                t_mp3.start()
+            return
+
         if wav is not None:
             try:
                 wav.close()
@@ -226,6 +396,8 @@ def main():
     buf = sys.stdin.buffer
 
     log(f"[same] Input rate={args.rate} Hz, detect rate={args.detect_rate} Hz")
+    if args.reconstruct_same:
+        log(f"[same] Reconstruction mode enabled, tone={args.tone}, tone_duration={tone_duration:.2f}s")
 
     shutdown_reason = None
     try:
@@ -248,6 +420,13 @@ def main():
             except BrokenPipeError:
                 shutdown_reason = "ffmpeg pipeline exited"
                 break
+            if args.reconstruct_same and recording and decode_pace_start is not None:
+                decode_pace_bytes += len(audio)
+                fed_seconds = decode_pace_bytes / bytes_per_second
+                elapsed_seconds = time.monotonic() - decode_pace_start
+                ahead_seconds = fed_seconds - elapsed_seconds
+                if ahead_seconds > decode_pace_slack_seconds:
+                    time.sleep(ahead_seconds - decode_pace_slack_seconds)
 
             # Check multimon decoded lines
             while lines:
@@ -257,21 +436,45 @@ def main():
                 payload = line.split("EAS:", 1)[1].strip()
 
                 if payload.startswith("ZCZC"):
-                    if recording and post_remaining is not None:
-                        stop_record("EOM superseded")
-                        start_record(payload, allow_prerec=False)
-                    elif not recording:
-                        start_record(payload)
+                    if args.reconstruct_same:
+                        if not recording:
+                            start_reconstructed_record(payload)
+                    else:
+                        if recording and post_remaining is not None:
+                            stop_record("EOM superseded")
+                            start_record(payload, allow_prerec=False)
+                        elif not recording:
+                            start_record(payload)
 
                 if payload.startswith("NNNN") and recording:
-                    if post_bytes > 0:
-                        post_remaining = post_bytes
-                        post_written = 0
+                    if args.reconstruct_same:
+                        stop_record("EOM", saw_eom=True)
                     else:
-                        stop_record("EOM")
+                        if post_bytes > 0:
+                            post_remaining = post_bytes
+                            post_written = 0
+                        else:
+                            stop_record("EOM")
 
             # Write original audio if recording
-            if recording and wav is not None:
+            if args.reconstruct_same:
+                if recording and wav is not None:
+                    if not capture_live_audio:
+                        if capture_skip_bytes >= len(audio):
+                            capture_skip_bytes -= len(audio)
+                            audio = b""
+                        else:
+                            if capture_skip_bytes > 0:
+                                audio = audio[capture_skip_bytes:]
+                                capture_skip_bytes = 0
+                            capture_live_audio = True
+                            log("[same] Capturing alert audio")
+                    if capture_live_audio and audio:
+                        record_buf.extend(audio)
+                        rec_bytes += len(audio)
+                        if max_bytes > 0 and rec_bytes >= max_bytes:
+                            stop_record("timeout")
+            elif recording and wav is not None:
                 wav.writeframes(audio)
                 rec_bytes += len(audio)
                 if max_bytes > 0 and rec_bytes >= max_bytes:
