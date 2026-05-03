@@ -37,9 +37,9 @@ At minimum, you'll need `sox` to run most of these examples. While ffmpeg works 
 rec -ts16 -r22050 -c1 - | easrecorder --rate 22050 --outdir ~/easrecorder
 ```
 
-With this, you should be able to play EAS tones on another device and your PC's microphone should pick them up. You can also use this to plug in a scanner and decode alerts that way.
+With this, you should be able to play EAS tones on another device and your PC's microphone should pick them up. You can also simply plug in a scanner and decode alerts that way.
 
-### From an audio file
+### Decode from an audio file
 
 ```bash
 sox file.mp3 -t s16 -c 1 -r 22050 -c 1 - | easrecorder --rate 22050 --outdir ~/easrecorder
