@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "easrecorder"
+version = "0.1.0"
+description = "Record and reconstruct EAS alerts from PCM audio streams"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9"
+authors = [
+  {name = "Max Baykowski"},
+]
+keywords = ["eas", "same", "emergency-alert-system", "audio", "recorder"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Operating System :: OS Independent",
+  "Environment :: Console",
+  "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.scripts]
+easrecorder = "easrecorder.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
