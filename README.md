@@ -27,6 +27,74 @@ After installation, run:
 easrecorder --help
 ```
 
+## Python API
+
+You can also run the recorder from another Python program without spawning the
+`easrecorder` command:
+
+```python
+from easrecorder import EASRecorder, RecorderSettings
+
+settings = RecorderSettings(
+    rate=22050,
+    outdir="/tmp/easrecorder",
+    pre_seconds=2.0,
+    post_seconds=5.0,
+    max_seconds=120,
+    save_format="wav",
+)
+
+recorder = EASRecorder(settings)
+recorder.run()
+```
+
+`run()` reads raw PCM bytes from `input_stream` until EOF. If you want to feed
+audio samples from your own code, use `start()`, `write()`, and `stop()`:
+
+```python
+from easrecorder import EASRecorder, RecorderSettings
+
+settings = RecorderSettings(rate=22050, outdir="/tmp/easrecorder")
+recorder = EASRecorder(settings)
+
+recorder.start()
+try:
+    recorder.write(pcm_bytes)
+    recorder.write(more_pcm_bytes)
+finally:
+    recorder.stop()
+```
+
+The bytes passed to `write()` must be raw signed 16-bit little-endian mono PCM
+at `settings.rate`. `rate` and `detect_rate` configure the decoder pipeline
+when `start()` runs, so changing those requires restarting the recorder.
+
+All command-line options are available through `RecorderSettings`:
+
+| CLI option | API setting |
+| --- | --- |
+| `--rate` | `rate` |
+| `--detect-rate` | `detect_rate` |
+| `--outdir` | `outdir` |
+| `--max-seconds` | `max_seconds` |
+| `--prefix` | `prefix` |
+| `--mp3` | `save_format="mp3"` |
+| `--local-time` | `local_time=True` |
+| `--reconstruct-same` | `reconstruct_same=True` |
+| `--tone` | `tone` |
+| `--tone-duration` | `tone_duration` |
+| `--year` | `year` |
+| `--pre-seconds` | `pre_seconds` |
+| `--post-seconds` | `post_seconds` |
+| `--stdout` | `copy_stdout=True` |
+
+The settings object is mutable. Alert-scoped values such as `pre_seconds`,
+`post_seconds`, `max_seconds`, `outdir`, `prefix`, `save_format`, `local_time`,
+`reconstruct_same`, `tone`, `tone_duration`, and `year` are snapshotted when a
+new SAME header starts. If you change one of those values during an active
+alert, the change applies to the next alert. `save_format` can be `"wav"` or
+`"mp3"`.
+
 ## Usage examples
 
 At minimum, you'll need `sox` to run most of these examples. While ffmpeg works too, most people prefer `sox` better as its syntax is easier to remember. You might also want to grab `rtl-sdr` while you're at it, as this readme does provide examples for decoding EAS alerts with an RTL SDR dongle.
@@ -99,4 +167,3 @@ rtl_fm -E deemp -F 9 -g 20 -M fm -f 88.1M -s 240000 - \
 ```
 
 Decode and record from 88.1 FM while playing the incoming audio through the default soundcard. The built-in resampler in `rtl_fm` isn't the greatest, so we resample from 240 KHz to 32 KHz using `sox` instead.
-
