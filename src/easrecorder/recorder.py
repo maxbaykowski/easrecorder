@@ -18,6 +18,7 @@ from typing import BinaryIO, TextIO
 MAX_PRERECORD_SECONDS = 10.0
 MAX_POSTRECORD_SECONDS = 10.0
 SAVE_FORMATS = {"wav", "mp3"}
+DECODER_DRAIN_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass
@@ -59,6 +60,26 @@ def _reader_thread(proc: subprocess.Popen, q: deque[str]) -> None:
         if not line:
             break
         q.append(line.decode("utf-8", errors="ignore").rstrip("\n"))
+
+
+def validate_cli_settings(settings: RecorderSettings) -> None:
+    """Validate combinations that are invalid for one-shot CLI startup."""
+
+    now_for_year = datetime.now() if settings.local_time else datetime.now(timezone.utc)
+    current_year = now_for_year.year
+    if settings.year is not None and (settings.year < 1997 or settings.year > current_year):
+        raise ValueError(f"year must be between 1997 and {current_year}")
+    if settings.reconstruct_same and (settings.pre_seconds != 0.0 or settings.post_seconds != 0.0):
+        raise ValueError("pre_seconds and post_seconds cannot be used with reconstruct_same")
+    if not settings.reconstruct_same and (settings.tone != "none" or settings.tone_duration is not None):
+        raise ValueError("tone and tone_duration require reconstruct_same")
+    if settings.tone == "none" and settings.tone_duration is not None:
+        raise ValueError("tone_duration requires tone='ebs' or tone='nwr'")
+    tone_duration = 10.0 if settings.tone_duration is None else settings.tone_duration
+    if settings.tone != "none" and not (8.0 <= tone_duration <= 25.0):
+        raise ValueError("tone_duration must be between 8 and 25 seconds")
+    if settings.save_format not in SAVE_FORMATS:
+        raise ValueError("save_format must be 'wav' or 'mp3'")
 
 
 class EASRecorder:
@@ -216,6 +237,8 @@ class EASRecorder:
     def stop(self, reason: str = "shutdown") -> None:
         """Stop the recorder and close any active alert."""
 
+        if self._started:
+            self._drain_decoder()
         if self._recording:
             try:
                 self._stop_record(reason)
@@ -238,6 +261,10 @@ class EASRecorder:
                 t_mp3.join()
             except Exception:
                 pass
+        self._mp3_threads.clear()
+        self._lines.clear()
+        self._pre_buf.clear()
+        self._pre_buf_bytes = 0
         self._started = False
         self._ffmpeg = None
         self._mm = None
@@ -287,6 +314,21 @@ class EASRecorder:
 
     def _log(self, msg: str) -> None:
         print(msg, file=self.log_stream, flush=True)
+
+    def _drain_decoder(self) -> None:
+        try:
+            if self._ffmpeg is not None and self._ffmpeg.stdin is not None:
+                self._ffmpeg.stdin.close()
+        except Exception:
+            pass
+        try:
+            if self._ffmpeg is not None:
+                self._ffmpeg.wait(timeout=DECODER_DRAIN_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+        if self._reader is not None:
+            self._reader.join(timeout=DECODER_DRAIN_TIMEOUT_SECONDS)
+        self._process_decoded_lines()
 
     def _process_decoded_lines(self) -> None:
         while self._lines:
@@ -625,7 +667,8 @@ class EASRecorder:
             raise ValueError("rate must be greater than zero")
         if self.settings.detect_rate <= 0:
             raise ValueError("detect_rate must be greater than zero")
-        self._validate_alert_settings()
+        if self.settings.save_format not in SAVE_FORMATS:
+            raise ValueError("save_format must be 'wav' or 'mp3'")
 
     def _validate_alert_settings(self) -> None:
         settings = self.settings
@@ -635,12 +678,13 @@ class EASRecorder:
             raise ValueError(f"year must be between 1997 and {current_year}")
         if settings.reconstruct_same and (settings.pre_seconds != 0.0 or settings.post_seconds != 0.0):
             raise ValueError("pre_seconds and post_seconds cannot be used with reconstruct_same")
-        if not settings.reconstruct_same and (settings.tone != "none" or settings.tone_duration is not None):
-            raise ValueError("tone and tone_duration require reconstruct_same")
-        if settings.tone == "none" and settings.tone_duration is not None:
-            raise ValueError("tone_duration requires tone='ebs' or tone='nwr'")
-        tone_duration = 10.0 if settings.tone_duration is None else settings.tone_duration
-        if settings.tone != "none" and not (8.0 <= tone_duration <= 25.0):
-            raise ValueError("tone_duration must be between 8 and 25 seconds")
+        if settings.reconstruct_same:
+            if settings.tone not in {"ebs", "nwr", "none"}:
+                raise ValueError("tone must be 'ebs', 'nwr', or 'none'")
+            if settings.tone == "none" and settings.tone_duration is not None:
+                raise ValueError("tone_duration requires tone='ebs' or tone='nwr'")
+            tone_duration = 10.0 if settings.tone_duration is None else settings.tone_duration
+            if settings.tone != "none" and not (8.0 <= tone_duration <= 25.0):
+                raise ValueError("tone_duration must be between 8 and 25 seconds")
         if settings.save_format not in SAVE_FORMATS:
             raise ValueError("save_format must be 'wav' or 'mp3'")

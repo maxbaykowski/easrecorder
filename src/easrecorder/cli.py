@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 
-from .recorder import EASRecorder, RecorderSettings
+from .recorder import EASRecorder, RecorderSettings, validate_cli_settings
 
 
 def main() -> None:
@@ -61,6 +61,7 @@ def main() -> None:
         copy_stdout=args.stdout,
     )
     try:
+        validate_cli_settings(settings)
         EASRecorder(settings).run()
     except ValueError as exc:
         ap.error(str(exc))
