@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -14,11 +13,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import BinaryIO, TextIO
 
+import lameenc
+import numpy as np
+import soxr
+
 
 MAX_PRERECORD_SECONDS = 10.0
 MAX_POSTRECORD_SECONDS = 10.0
 SAVE_FORMATS = {"wav", "mp3"}
 DECODER_DRAIN_TIMEOUT_SECONDS = 1.0
+MP3_SAMPLE_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
 
 
 @dataclass
@@ -104,8 +108,9 @@ class EASRecorder:
             sys.stderr if settings.copy_stdout else sys.stdout
         )
 
-        self._ffmpeg: subprocess.Popen | None = None
         self._mm: subprocess.Popen | None = None
+        self._detector_resampler: soxr.ResampleStream | None = None
+        self._pcm_remainder = b""
         self._lines: deque[str] = deque()
         self._reader: threading.Thread | None = None
         self._started = False
@@ -148,44 +153,23 @@ class EASRecorder:
         self._validate_static_settings()
         os.makedirs(self.settings.outdir, exist_ok=True)
 
-        self._ffmpeg = subprocess.Popen(
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "s16le",
-                "-ar",
-                str(self.settings.rate),
-                "-ac",
-                "1",
-                "-i",
-                "pipe:0",
-                "-f",
-                "s16le",
-                "-acodec",
-                "pcm_s16le",
-                "-ac",
-                "1",
-                "-ar",
-                str(self.settings.detect_rate),
-                "pipe:1",
-            ],
+        self._mm = subprocess.Popen(
+            ["multimon-ng", "-t", "raw", "-a", "EAS", "-f", str(self.settings.detect_rate), "-"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,
         )
-
-        self._mm = subprocess.Popen(
-            ["multimon-ng", "-t", "raw", "-a", "EAS", "-f", str(self.settings.detect_rate), "-"],
-            stdin=self._ffmpeg.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=0,
-        )
+        if self.settings.rate == self.settings.detect_rate:
+            self._detector_resampler = None
+        else:
+            self._detector_resampler = soxr.ResampleStream(
+                self.settings.rate,
+                self.settings.detect_rate,
+                1,
+                dtype="int16",
+            )
+        self._pcm_remainder = b""
         self._lines.clear()
         self._reader = threading.Thread(target=_reader_thread, args=(self._mm, self._lines), daemon=True)
         self._reader.start()
@@ -211,7 +195,12 @@ class EASRecorder:
         if not samples:
             return
 
-        audio = samples
+        detector_audio = self._pcm_remainder + samples
+        complete_bytes = len(detector_audio) - (len(detector_audio) % 2)
+        audio = detector_audio[:complete_bytes]
+        self._pcm_remainder = detector_audio[complete_bytes:]
+        if not audio:
+            return
         if self.settings.copy_stdout:
             try:
                 self.output_stream.write(audio)
@@ -222,11 +211,11 @@ class EASRecorder:
                 raise RuntimeError("stdout pipeline exited") from exc
 
         try:
-            assert self._ffmpeg is not None
-            assert self._ffmpeg.stdin is not None
-            self._ffmpeg.stdin.write(audio)
+            assert self._mm is not None
+            assert self._mm.stdin is not None
+            self._mm.stdin.write(self._resample_for_detector(audio))
         except BrokenPipeError as exc:
-            raise RuntimeError("ffmpeg pipeline exited") from exc
+            raise RuntimeError("multimon-ng pipeline exited") from exc
 
         if self._active_alert is not None and self._active_alert.reconstruct_same and self._recording:
             self._pace_reconstruction_decode(len(audio))
@@ -245,11 +234,11 @@ class EASRecorder:
             except Exception:
                 pass
         try:
-            if self._ffmpeg is not None and self._ffmpeg.stdin is not None:
-                self._ffmpeg.stdin.close()
+            if self._mm is not None and self._mm.stdin is not None:
+                self._mm.stdin.close()
         except Exception:
             pass
-        for proc in (self._mm, self._ffmpeg):
+        for proc in (self._mm,):
             if proc is None:
                 continue
             try:
@@ -266,8 +255,9 @@ class EASRecorder:
         self._pre_buf.clear()
         self._pre_buf_bytes = 0
         self._started = False
-        self._ffmpeg = None
         self._mm = None
+        self._detector_resampler = None
+        self._pcm_remainder = b""
         self._reader = None
 
     def run(self) -> None:
@@ -317,18 +307,31 @@ class EASRecorder:
 
     def _drain_decoder(self) -> None:
         try:
-            if self._ffmpeg is not None and self._ffmpeg.stdin is not None:
-                self._ffmpeg.stdin.close()
+            if self._mm is not None and self._mm.stdin is not None:
+                if self._detector_resampler is not None:
+                    tail = self._detector_resampler.resample_chunk(
+                        np.empty(0, dtype=np.int16),
+                        last=True,
+                    )
+                    if tail.size:
+                        self._mm.stdin.write(tail.tobytes())
+                self._mm.stdin.close()
         except Exception:
             pass
         try:
-            if self._ffmpeg is not None:
-                self._ffmpeg.wait(timeout=DECODER_DRAIN_TIMEOUT_SECONDS)
+            if self._mm is not None:
+                self._mm.wait(timeout=DECODER_DRAIN_TIMEOUT_SECONDS)
         except Exception:
             pass
         if self._reader is not None:
             self._reader.join(timeout=DECODER_DRAIN_TIMEOUT_SECONDS)
         self._process_decoded_lines()
+
+    def _resample_for_detector(self, audio: bytes) -> bytes:
+        if self._detector_resampler is None:
+            return audio
+        samples = np.frombuffer(audio, dtype="<i2").astype(np.int16, copy=False)
+        return self._detector_resampler.resample_chunk(samples).tobytes()
 
     def _process_decoded_lines(self) -> None:
         while self._lines:
@@ -553,41 +556,50 @@ class EASRecorder:
 
     def _convert_to_mp3(self, wav_path: str) -> None:
         mp3_path = os.path.splitext(wav_path)[0] + ".mp3"
-        ffmpeg_path = shutil.which("ffmpeg")
-        if not ffmpeg_path:
-            self._log("[same] MP3 requested but ffmpeg is not available.")
-            return
-        cmd = [
-            ffmpeg_path,
-            "-nostdin",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            wav_path,
-            "-codec:a",
-            "libmp3lame",
-            "-b:a",
-            "192k",
-            mp3_path,
-        ]
+        temp_mp3_path = mp3_path + ".tmp"
         try:
-            result = subprocess.run(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if result.returncode == 0:
-                try:
-                    os.remove(wav_path)
-                except Exception:
-                    pass
-                self._log(f"[same] Writing: {mp3_path}")
-            else:
-                self._log("[same] MP3 conversion failed; keeping WAV.")
+            with wave.open(wav_path, "rb") as source:
+                source_rate = source.getframerate()
+                target_rate = min(MP3_SAMPLE_RATES, key=lambda rate: abs(rate - source_rate))
+                encoder = lameenc.Encoder()
+                encoder.set_bit_rate(192)
+                encoder.set_in_sample_rate(target_rate)
+                encoder.set_out_sample_rate(target_rate)
+                encoder.set_channels(1)
+                encoder.set_quality(2)
+                resampler = None
+                if source_rate != target_rate:
+                    resampler = soxr.ResampleStream(
+                        source_rate,
+                        target_rate,
+                        1,
+                        dtype="int16",
+                    )
+
+                with open(temp_mp3_path, "wb") as output:
+                    while True:
+                        pcm = source.readframes(8192)
+                        if not pcm:
+                            break
+                        if resampler is not None:
+                            samples = np.frombuffer(pcm, dtype="<i2").astype(np.int16, copy=False)
+                            pcm = resampler.resample_chunk(samples).tobytes()
+                        if pcm:
+                            output.write(encoder.encode(pcm))
+                    if resampler is not None:
+                        tail = resampler.resample_chunk(np.empty(0, dtype=np.int16), last=True)
+                        if tail.size:
+                            output.write(encoder.encode(tail.tobytes()))
+                    output.write(encoder.flush())
+
+            os.replace(temp_mp3_path, mp3_path)
+            os.remove(wav_path)
+            self._log(f"[same] Writing: {mp3_path}")
         except Exception:
+            try:
+                os.remove(temp_mp3_path)
+            except OSError:
+                pass
             self._log("[same] MP3 conversion failed; keeping WAV.")
 
     def _silence_bytes(self, seconds: float) -> bytes:

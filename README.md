@@ -7,14 +7,18 @@ This program can record EAS alerts and save them as audio files. It can decode f
 pip install .
 ```
 
-This package has no Python dependencies, but it requires these external tools at runtime:
+The package installs these Python dependencies automatically:
 
-- `ffmpeg`
-- `multimon-ng`
+- `soxr` for streaming sample-rate conversion
+- `lameenc` for optional MP3 encoding
+
+It requires one external tool at runtime:
+
+- `multimon-ng` for decoding SAME headers
 
 On Debian based distros, you can install these dependencies by running:
 ```bash
-sudo apt install ffmpeg multimon-ng
+sudo apt install multimon-ng
 ```
 
 You may have to compile `multimon-ng` from source if you're using some other distro.
@@ -97,7 +101,7 @@ alert, the change applies to the next alert. `save_format` can be `"wav"` or
 
 ## Usage examples
 
-At minimum, you'll need `sox` to run most of these examples. While ffmpeg works too, most people prefer `sox` better as its syntax is easier to remember. You might also want to grab `rtl-sdr` while you're at it, as this readme does provide examples for decoding EAS alerts with an RTL SDR dongle.
+At minimum, you'll need `sox` to run most of these examples. You might also want to grab `rtl-sdr` while you're at it, as this readme does provide examples for decoding EAS alerts with an RTL SDR dongle.
 
 ### Decode from the default input device
 
