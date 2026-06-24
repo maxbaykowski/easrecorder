@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -23,6 +25,12 @@ MAX_POSTRECORD_SECONDS = 10.0
 SAVE_FORMATS = {"wav", "mp3"}
 DECODER_DRAIN_TIMEOUT_SECONDS = 1.0
 MP3_SAMPLE_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
+INDEX_VERSION = 1
+SAME_HEADER_RE = re.compile(
+    r"^ZCZC-(?P<originator>[A-Z0-9]{3})-(?P<event_type>[A-Z0-9]{3})-"
+    r"(?P<fips_codes>\d{6}(?:-\d{6})*)\+(?P<duration_code>\d{4})-"
+    r"(?P<timestamp>\d{7})-(?P<sender_id>[^-]{1,8})-?$"
+)
 
 
 @dataclass
@@ -41,6 +49,19 @@ class RecorderSettings:
     pre_seconds: float = 0.0
     post_seconds: float = 0.0
     copy_stdout: bool = False
+    index_path: str | None = None
+
+
+@dataclass(frozen=True)
+class SameHeader:
+    raw_header: str
+    event_type: str
+    originator: str
+    fips_codes: tuple[str, ...]
+    start_time_utc: datetime
+    duration_code: str
+    duration_seconds: int
+    sender_id: str
 
 
 @dataclass(frozen=True)
@@ -56,6 +77,68 @@ class _AlertSettings:
     name_year: int
     pre_bytes: int
     post_bytes: int
+    index_path: str | None
+
+
+def parse_same_header(
+    header_line: str,
+    year: int | None = None,
+    now: datetime | None = None,
+) -> SameHeader:
+    """Parse a SAME header while preserving unknown event/originator codes."""
+
+    raw_header = header_line.strip()
+    now_utc = now or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+    header_year = year if year is not None else now_utc.year
+    match = SAME_HEADER_RE.fullmatch(raw_header)
+    if match is None:
+        parts = raw_header.split("-")
+        originator = parts[1] if len(parts) > 1 and parts[1] else "UNK"
+        event_type = parts[2] if len(parts) > 2 and parts[2] else "UNK"
+        return SameHeader(
+            raw_header=raw_header,
+            event_type=event_type,
+            originator=originator,
+            fips_codes=(),
+            start_time_utc=now_utc.replace(second=0, microsecond=0),
+            duration_code="0000",
+            duration_seconds=0,
+            sender_id="UNKNOWN",
+        )
+
+    duration_code = match.group("duration_code")
+    duration_seconds = (int(duration_code[:2]) * 60 + int(duration_code[2:])) * 60
+    timestamp = match.group("timestamp")
+    try:
+        julian_day = int(timestamp[:3])
+        hour = int(timestamp[3:5])
+        minute = int(timestamp[5:7])
+        if not 1 <= julian_day <= 366 or hour > 23 or minute > 59:
+            raise ValueError
+        start_time_utc = datetime(header_year, 1, 1, tzinfo=timezone.utc) + timedelta(
+            days=julian_day - 1,
+            hours=hour,
+            minutes=minute,
+        )
+        if start_time_utc.year != header_year:
+            raise ValueError
+    except ValueError:
+        start_time_utc = now_utc.replace(second=0, microsecond=0)
+
+    return SameHeader(
+        raw_header=raw_header,
+        event_type=match.group("event_type"),
+        originator=match.group("originator"),
+        fips_codes=tuple(match.group("fips_codes").split("-")),
+        start_time_utc=start_time_utc,
+        duration_code=duration_code,
+        duration_seconds=duration_seconds,
+        sender_id=match.group("sender_id").strip() or "UNKNOWN",
+    )
 
 
 def _reader_thread(proc: subprocess.Popen, q: deque[str]) -> None:
@@ -124,9 +207,11 @@ class EASRecorder:
         self._capture_skip_bytes = 0
         self._capture_live_audio = False
         self._record_buf = bytearray()
+        self._active_header: SameHeader | None = None
         self._decode_pace_start: float | None = None
         self._decode_pace_bytes = 0
         self._mp3_threads: list[threading.Thread] = []
+        self._index_lock = threading.Lock()
         self._pre_buf: deque[bytes] = deque()
         self._pre_buf_bytes = 0
         self._active_alert: _AlertSettings | None = None
@@ -300,6 +385,7 @@ class EASRecorder:
             name_year=name_year,
             pre_bytes=int(max(0.0, min(MAX_PRERECORD_SECONDS, settings.pre_seconds)) * settings.rate * 2),
             post_bytes=int(max(0.0, min(MAX_POSTRECORD_SECONDS, settings.post_seconds)) * settings.rate * 2),
+            index_path=settings.index_path,
         )
 
     def _log(self, msg: str) -> None:
@@ -410,32 +496,14 @@ class EASRecorder:
             time.sleep(ahead_seconds - self._decode_pace_slack_seconds)
 
     def _parse_event_and_timestamp(self, header_line: str, alert: _AlertSettings):
-        event = "UNK"
-        now = datetime.now() if alert.local_time else datetime.now(timezone.utc)
-        date_str = now.strftime("%m-%d-") + f"{alert.name_year:04d}"
-        time_str = now.strftime("%H%M")
-        tz_str = now.tzname() or ("UTC" if not alert.local_time else "LOCAL")
-        if not header_line.startswith("ZCZC"):
-            return event, date_str, time_str, tz_str
-        parts = header_line.split("-")
-        if len(parts) >= 3:
-            event = parts[2] or event
-        jjj_match = re.search(r"-(\d{7})-", header_line)
-        if jjj_match:
-            jjjhhmm = jjj_match.group(1)
-            try:
-                jjj = int(jjjhhmm[:3])
-                hhmm = jjjhhmm[3:7]
-                hh = int(hhmm[:2])
-                mm = int(hhmm[2:4])
-                dt_utc = datetime(alert.name_year, 1, 1, hh, mm, tzinfo=timezone.utc) + timedelta(days=jjj - 1)
-                dt = dt_utc.astimezone() if alert.local_time else dt_utc
-                date_str = dt.strftime("%m-%d-%Y")
-                time_str = dt.strftime("%H%M")
-                tz_str = dt.tzname() or ("UTC" if not alert.local_time else "LOCAL")
-            except Exception:
-                pass
-        return event, date_str, time_str, tz_str
+        parsed = parse_same_header(header_line, year=alert.name_year)
+        timestamp = parsed.start_time_utc.astimezone() if alert.local_time else parsed.start_time_utc
+        return (
+            parsed.event_type,
+            timestamp.strftime("%m-%d-%Y"),
+            timestamp.strftime("%H%M"),
+            timestamp.tzname() or ("LOCAL" if alert.local_time else "UTC"),
+        )
 
     def _build_output_path(self, header_line: str, alert: _AlertSettings) -> str:
         event, date_str, time_str, tz_str = self._parse_event_and_timestamp(header_line, alert)
@@ -462,6 +530,7 @@ class EASRecorder:
 
     def _start_record(self, header_line: str, allow_prerec: bool = True) -> None:
         self._active_alert = self.snapshot_alert_settings()
+        self._active_header = parse_same_header(header_line, year=self._active_alert.name_year)
         self._wav = self._open_output_wav(header_line, self._active_alert)
         self._recording = True
         self._rec_bytes = 0
@@ -480,6 +549,7 @@ class EASRecorder:
 
     def _start_reconstructed_record(self, header_line: str) -> None:
         self._active_alert = self.snapshot_alert_settings()
+        self._active_header = parse_same_header(header_line, year=self._active_alert.name_year)
         self._wav = self._open_output_wav(header_line, self._active_alert)
         self._recording = True
         self._rec_bytes = 0
@@ -497,6 +567,7 @@ class EASRecorder:
 
     def _stop_record(self, reason: str, saw_eom: bool = False) -> None:
         alert = self._active_alert
+        header = self._active_header
         if alert is not None and alert.reconstruct_same and self._wav is not None:
             trim_bytes = 0
             if saw_eom and self._record_buf:
@@ -524,8 +595,9 @@ class EASRecorder:
             if trim_bytes > 0:
                 trim_seconds_actual = trim_bytes / self._bytes_per_second
                 self._log(f"[same] Trimmed: {trim_bytes} bytes (~{trim_seconds_actual:.2f}s)")
-            self._maybe_convert_to_mp3(alert)
+            self._finalize_output(alert, header)
             self._active_alert = None
+            self._active_header = None
             return
 
         if self._wav is not None:
@@ -542,21 +614,35 @@ class EASRecorder:
             self._log(f"[same] Append: {self._post_written} bytes (~{post_seconds_actual:.2f}s)")
         self._post_written = 0
         if alert is not None:
-            self._maybe_convert_to_mp3(alert)
+            self._finalize_output(alert, header)
         self._active_alert = None
+        self._active_header = None
 
-    def _maybe_convert_to_mp3(self, alert: _AlertSettings) -> None:
-        if alert.save_format != "mp3" or not self._cur_path:
+    def _finalize_output(self, alert: _AlertSettings, header: SameHeader | None) -> None:
+        if not self._cur_path:
             return
         wav_path = self._cur_path
         self._cur_path = None
-        t_mp3 = threading.Thread(target=self._convert_to_mp3, args=(wav_path,), daemon=True)
+        if alert.save_format != "mp3":
+            self._write_index_entry(alert, header, wav_path)
+            return
+        t_mp3 = threading.Thread(
+            target=self._convert_to_mp3,
+            args=(wav_path, alert, header),
+            daemon=True,
+        )
         self._mp3_threads.append(t_mp3)
         t_mp3.start()
 
-    def _convert_to_mp3(self, wav_path: str) -> None:
+    def _convert_to_mp3(
+        self,
+        wav_path: str,
+        alert: _AlertSettings | None = None,
+        header: SameHeader | None = None,
+    ) -> None:
         mp3_path = os.path.splitext(wav_path)[0] + ".mp3"
         temp_mp3_path = mp3_path + ".tmp"
+        final_path = wav_path
         try:
             with wave.open(wav_path, "rb") as source:
                 source_rate = source.getframerate()
@@ -593,6 +679,7 @@ class EASRecorder:
                     output.write(encoder.flush())
 
             os.replace(temp_mp3_path, mp3_path)
+            final_path = mp3_path
             os.remove(wav_path)
             self._log(f"[same] Writing: {mp3_path}")
         except Exception:
@@ -601,6 +688,76 @@ class EASRecorder:
             except OSError:
                 pass
             self._log("[same] MP3 conversion failed; keeping WAV.")
+        if alert is not None:
+            self._write_index_entry(alert, header, final_path)
+
+    def _write_index_entry(
+        self,
+        alert: _AlertSettings,
+        header: SameHeader | None,
+        output_path: str,
+    ) -> None:
+        if alert.index_path is None or header is None:
+            return
+        index_path = alert.index_path
+        if not os.path.isabs(index_path):
+            index_path = os.path.join(alert.outdir, index_path)
+        index_path = os.path.abspath(index_path)
+        start_time = header.start_time_utc.astimezone(timezone.utc)
+        expires_at = start_time + timedelta(seconds=header.duration_seconds)
+        entry = {
+            "raw_same_header": header.raw_header,
+            "event_type": header.event_type,
+            "originator": header.originator,
+            "fips_codes": list(header.fips_codes),
+            "start_time_utc": start_time.isoformat().replace("+00:00", "Z"),
+            "duration_code": header.duration_code,
+            "duration_seconds": header.duration_seconds,
+            "expires_at_utc": expires_at.isoformat().replace("+00:00", "Z"),
+            "sender_id": header.sender_id,
+            "file_path": os.path.abspath(output_path),
+        }
+
+        with self._index_lock:
+            try:
+                data = self._read_index(index_path)
+                alerts = data["alerts"]
+                alerts.insert(0, entry)
+                alerts.sort(key=lambda item: item.get("start_time_utc", ""), reverse=True)
+                self._replace_index(index_path, data)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._log(f"[same] Index update failed: {exc}")
+
+    def _read_index(self, index_path: str) -> dict:
+        if not os.path.exists(index_path):
+            return {"version": INDEX_VERSION, "alerts": []}
+        with open(index_path, "r", encoding="utf-8") as source:
+            data = json.load(source)
+        if isinstance(data, list):
+            alerts = data
+            data = {"version": INDEX_VERSION, "alerts": alerts}
+        if not isinstance(data, dict) or not isinstance(data.get("alerts"), list):
+            raise ValueError("index must be an object containing an alerts array")
+        if not all(isinstance(entry, dict) for entry in data["alerts"]):
+            raise ValueError("every index alert must be a JSON object")
+        data["version"] = INDEX_VERSION
+        return data
+
+    def _replace_index(self, index_path: str, data: dict) -> None:
+        parent = os.path.dirname(index_path)
+        os.makedirs(parent, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".index-", suffix=".tmp", dir=parent, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                json.dump(data, output, indent=2)
+                output.write("\n")
+            os.replace(temp_path, index_path)
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
 
     def _silence_bytes(self, seconds: float) -> bytes:
         return b"\x00\x00" * max(0, int(round(seconds * self.settings.rate)))

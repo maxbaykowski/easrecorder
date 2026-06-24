@@ -46,6 +46,7 @@ settings = RecorderSettings(
     post_seconds=5.0,
     max_seconds=120,
     save_format="wav",
+    index_path="index.json",
 )
 
 recorder = EASRecorder(settings)
@@ -90,14 +91,50 @@ All command-line options are available through `RecorderSettings`:
 | `--year` | `year` |
 | `--pre-seconds` | `pre_seconds` |
 | `--post-seconds` | `post_seconds` |
+| `--index [PATH]` | `index_path` |
 | `--stdout` | `copy_stdout=True` |
 
 The settings object is mutable. Alert-scoped values such as `pre_seconds`,
 `post_seconds`, `max_seconds`, `outdir`, `prefix`, `save_format`, `local_time`,
-`reconstruct_same`, `tone`, `tone_duration`, and `year` are snapshotted when a
-new SAME header starts. If you change one of those values during an active
-alert, the change applies to the next alert. `save_format` can be `"wav"` or
-`"mp3"`.
+`reconstruct_same`, `tone`, `tone_duration`, `year`, and `index_path` are
+snapshotted when a new SAME header starts. If you change one of those values
+during an active alert, the change applies to the next alert. `save_format` can
+be `"wav"` or `"mp3"`. Set `index_path` to a path to enable indexing or to
+`None` to disable it live. Relative index paths are resolved inside `outdir`.
+
+## Alert index
+
+Pass `--index` to maintain `index.json` in the output directory, or pass an
+explicit path with `--index PATH`. Existing indexes are loaded and updated on
+subsequent runs. Alerts are sorted newest-first and updates use atomic file
+replacement.
+
+The index is a versioned JSON object:
+
+```json
+{
+  "version": 1,
+  "alerts": [
+    {
+      "raw_same_header": "ZCZC-WXR-TOR-039173-039051+0030-1591829-KCLE/NWS-",
+      "event_type": "TOR",
+      "originator": "WXR",
+      "fips_codes": ["039173", "039051"],
+      "start_time_utc": "2026-06-08T18:29:00Z",
+      "duration_code": "0030",
+      "duration_seconds": 1800,
+      "expires_at_utc": "2026-06-08T18:59:00Z",
+      "sender_id": "KCLE/NWS",
+      "file_path": "/absolute/path/to/TOR-06-08-2026-1829UTC.wav"
+    }
+  ]
+}
+```
+
+Unknown event or originator codes are retained as received. `start_time_utc`
+comes from the SAME Julian day/time field and uses the configured `year`, or
+the current system year when no year is configured. The public
+`parse_same_header()` function exposes the same parser to Python applications.
 
 ## Usage examples
 

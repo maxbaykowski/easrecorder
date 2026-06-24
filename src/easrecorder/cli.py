@@ -41,6 +41,13 @@ def main() -> None:
     )
     ap.add_argument("--pre-seconds", type=float, default=0.0, help="Seconds of audio to prepend (max 10)")
     ap.add_argument("--post-seconds", type=float, default=0.0, help="Seconds of audio to append (max 10)")
+    ap.add_argument(
+        "--index",
+        nargs="?",
+        const="index.json",
+        metavar="PATH",
+        help="Maintain a newest-first JSON alert index (default: OUTDIR/index.json)",
+    )
     ap.add_argument("--stdout", action="store_true", help="Copy input audio to stdout for pipelines")
     args = ap.parse_args()
 
@@ -58,6 +65,7 @@ def main() -> None:
         year=args.year,
         pre_seconds=args.pre_seconds,
         post_seconds=args.post_seconds,
+        index_path=args.index,
         copy_stdout=args.stdout,
     )
     try:
