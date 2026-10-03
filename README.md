@@ -31,6 +31,35 @@ After installation, run:
 easrecorder --help
 ```
 
+## What gets recorded
+
+Recordings start at the beginning of the first SAME header burst and end after
+the third EOM (`NNNN`) burst. `multimon-ng` only reports a header once two
+bursts match, so the recorder keeps the last 30 seconds of audio and uses a
+built-in SAME preamble detector to find where the first burst began. If the
+detector misses it, the recorder estimates the start from the first header
+burst `multimon-ng` decoded. If fewer than three EOMs decode, the recording
+ends after the last one heard once no other arrives within 4 seconds.
+
+`--pre-seconds` adds audio before the first header and `--post-seconds` adds
+audio after the last EOM. `--reconstruct-same` replaces the received headers
+and EOMs with generated ones.
+
+When a new header arrives, the current recording ends where that header's
+first burst began and a new recording starts there:
+
+- Back-to-back alerts: when a header follows the EOMs, post-recording stops
+  at the new header, and the new alert's pre-recording never reaches back
+  into the previous alert.
+- Interrupted alerts: when a header cuts into an alert before its EOMs, as
+  sometimes happens on NOAA Weather Radio, the interrupted alert is saved and
+  the new one starts.
+
+Because of this, alert audio is written to disk about 20 seconds behind the
+live stream. A repeated alert with the same header as the one before it is
+recorded as a separate file with `-2`, `-3`, and so on added to its name;
+existing files are never overwritten.
+
 ## Python API
 
 You can also run the recorder from another Python program without spawning the

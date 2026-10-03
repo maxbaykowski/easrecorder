@@ -68,7 +68,7 @@ class AlertIndexTests(unittest.TestCase):
             recorder._lines.append(f"EAS: {HEADER}")
             recorder._process_decoded_lines()
             recorder._write_alert_audio(b"\x00\x00" * 100)
-            recorder._lines.append("EAS: NNNN")
+            recorder._lines.extend(["EAS: NNNN"] * 3)
             recorder._process_decoded_lines()
 
             data = json.loads((Path(tmp) / "index.json").read_text(encoding="utf-8"))
@@ -76,6 +76,20 @@ class AlertIndexTests(unittest.TestCase):
             self.assertEqual(entry["raw_same_header"], HEADER)
             self.assertTrue(Path(entry["file_path"]).is_absolute())
             self.assertTrue(Path(entry["file_path"]).exists())
+
+    def test_wav_file_timestamp_uses_same_issuance_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RecorderSettings(rate=22050, outdir=tmp, year=2026)
+            recorder = EASRecorder(settings, log_stream=io.StringIO())
+            recorder._lines.append(f"EAS: {HEADER}")
+            recorder._process_decoded_lines()
+            recorder._write_alert_audio(b"\x00\x00" * 100)
+            recorder._lines.extend(["EAS: NNNN"] * 3)
+            recorder._process_decoded_lines()
+
+            output_path = next(Path(tmp).glob("*.wav"))
+            expected = parse_same_header(HEADER, year=2026).start_time_utc.timestamp()
+            self.assertAlmostEqual(output_path.stat().st_mtime, expected, delta=1.0)
 
     def test_mp3_index_waits_for_conversion_and_uses_final_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -90,7 +104,7 @@ class AlertIndexTests(unittest.TestCase):
             recorder._lines.append(f"EAS: {HEADER}")
             recorder._process_decoded_lines()
             recorder._write_alert_audio(b"\x00\x00" * 2205)
-            recorder._lines.append("EAS: NNNN")
+            recorder._lines.extend(["EAS: NNNN"] * 3)
             recorder._process_decoded_lines()
             for conversion in recorder._mp3_threads:
                 conversion.join()
@@ -99,6 +113,27 @@ class AlertIndexTests(unittest.TestCase):
             file_path = Path(data["alerts"][0]["file_path"])
             self.assertEqual(file_path.suffix, ".mp3")
             self.assertTrue(file_path.exists())
+
+    def test_mp3_file_timestamp_uses_same_issuance_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RecorderSettings(
+                rate=22050,
+                outdir=tmp,
+                year=2026,
+                save_format="mp3",
+            )
+            recorder = EASRecorder(settings, log_stream=io.StringIO())
+            recorder._lines.append(f"EAS: {HEADER}")
+            recorder._process_decoded_lines()
+            recorder._write_alert_audio(b"\x00\x00" * 2205)
+            recorder._lines.extend(["EAS: NNNN"] * 3)
+            recorder._process_decoded_lines()
+            for conversion in recorder._mp3_threads:
+                conversion.join()
+
+            output_path = next(Path(tmp).glob("*.mp3"))
+            expected = parse_same_header(HEADER, year=2026).start_time_utc.timestamp()
+            self.assertAlmostEqual(output_path.stat().st_mtime, expected, delta=1.0)
 
     def test_merges_prior_index_and_sorts_newest_first(self):
         with tempfile.TemporaryDirectory() as tmp:

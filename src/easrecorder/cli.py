@@ -39,8 +39,8 @@ def main() -> None:
         type=int,
         help="Explicit year for filename timestamps (must be between 1997 and current year)",
     )
-    ap.add_argument("--pre-seconds", type=float, default=0.0, help="Seconds of audio to prepend (max 10)")
-    ap.add_argument("--post-seconds", type=float, default=0.0, help="Seconds of audio to append (max 10)")
+    ap.add_argument("--pre-seconds", type=float, default=0.0, help="Seconds of audio to keep before the first SAME header (max 10)")
+    ap.add_argument("--post-seconds", type=float, default=0.0, help="Seconds of audio to keep after the last EOM (max 10)")
     ap.add_argument(
         "--index",
         nargs="?",
