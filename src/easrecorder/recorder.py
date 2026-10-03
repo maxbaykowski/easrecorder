@@ -16,11 +16,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, BinaryIO, Callable, TextIO
 
 import numpy as np
-import soxr
 
 from .attention_tone_detector import ATTENTION_TONE_MIN_SECONDS, AttentionTone, AttentionToneTracker
 from .mp3_encoder import Mp3Encoder
 from .same_preamble_detector import SAME_BAUD, SameBurst, SamePreambleTracker
+from .soxr_native import SoxrStream
 
 
 MAX_PRERECORD_SECONDS = 10.0
@@ -235,7 +235,7 @@ class EASRecorder:
         )
 
         self._mm: subprocess.Popen | None = None
-        self._detector_resampler: soxr.ResampleStream | None = None
+        self._detector_resampler: SoxrStream | None = None
         self._pcm_remainder = b""
         self._lines: deque[str] = deque()
         self._reader: threading.Thread | None = None
@@ -318,12 +318,7 @@ class EASRecorder:
         if self.settings.rate == self.settings.detect_rate:
             self._detector_resampler = None
         else:
-            self._detector_resampler = soxr.ResampleStream(
-                self.settings.rate,
-                self.settings.detect_rate,
-                1,
-                dtype="int16",
-            )
+            self._detector_resampler = SoxrStream(self.settings.rate, self.settings.detect_rate, "int16")
         self._pcm_remainder = b""
         self._lines.clear()
         self._reset_stream()
@@ -470,10 +465,7 @@ class EASRecorder:
         try:
             if self._mm is not None and self._mm.stdin is not None:
                 if self._detector_resampler is not None:
-                    tail = self._detector_resampler.resample_chunk(
-                        np.empty(0, dtype=np.int16),
-                        last=True,
-                    )
+                    tail = self._detector_resampler.process(np.empty(0, dtype=np.int16), last=True)
                     if tail.size:
                         self._mm.stdin.write(tail.tobytes())
                 self._mm.stdin.close()
@@ -492,7 +484,7 @@ class EASRecorder:
         if self._detector_resampler is None:
             return audio
         samples = np.frombuffer(audio, dtype="<i2").astype(np.int16, copy=False)
-        return self._detector_resampler.resample_chunk(samples).tobytes()
+        return self._detector_resampler.process(samples).tobytes()
 
     def _process_decoded_lines(self) -> None:
         while self._lines:
@@ -1036,12 +1028,7 @@ class EASRecorder:
                 target_rate = min(MP3_SAMPLE_RATES, key=lambda rate: abs(rate - source_rate))
                 resampler = None
                 if source_rate != target_rate:
-                    resampler = soxr.ResampleStream(
-                        source_rate,
-                        target_rate,
-                        1,
-                        dtype="int16",
-                    )
+                    resampler = SoxrStream(source_rate, target_rate, "int16")
 
                 with Mp3Encoder(target_rate, MP3_BITRATE_KBPS) as encoder, open(temp_mp3_path, "wb") as output:
                     while True:
@@ -1050,11 +1037,11 @@ class EASRecorder:
                             break
                         if resampler is not None:
                             samples = np.frombuffer(pcm, dtype="<i2").astype(np.int16, copy=False)
-                            pcm = resampler.resample_chunk(samples).tobytes()
+                            pcm = resampler.process(samples).tobytes()
                         if pcm:
                             output.write(encoder.encode(pcm))
                     if resampler is not None:
-                        tail = resampler.resample_chunk(np.empty(0, dtype=np.int16), last=True)
+                        tail = resampler.process(np.empty(0, dtype=np.int16), last=True)
                         if tail.size:
                             output.write(encoder.encode(tail.tobytes()))
                     output.write(encoder.flush())

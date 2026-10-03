@@ -9,6 +9,7 @@ from unittest.mock import patch
 import easrecorder.recorder as recorder_module
 from easrecorder import EASRecorder, RecorderSettings
 from easrecorder.mp3_encoder import Mp3EncoderError
+from easrecorder.soxr_native import soxr_library
 
 
 class _FakePipe:
@@ -42,6 +43,9 @@ class _FakeProcess:
 
 class AudioBackendTests(unittest.TestCase):
     def test_detector_audio_is_stream_resampled(self):
+        # Finding libsoxr runs a subprocess of its own (ctypes.util.find_library), so
+        # load it before Popen is replaced with the fake decoder.
+        soxr_library()
         with patch.object(recorder_module.subprocess, "Popen", _FakeProcess):
             recorder = EASRecorder(
                 RecorderSettings(rate=44100, detect_rate=22050),

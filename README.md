@@ -7,23 +7,24 @@ This program can record EAS alerts and save them as audio files. It can decode f
 pip install .
 ```
 
-The package installs these Python dependencies automatically:
+The package installs one Python dependency automatically:
 
 - `numpy` for audio processing and SAME and attention tone detection
-- `soxr` for streaming sample-rate conversion
 
 It also needs these from your system:
 
 - `multimon-ng` for decoding SAME headers
+- the SoX resampler library (`libsoxr`) for sample-rate conversion; it is
+  needed unless the input is already at the decoder's 22050 Hz
 - the LAME library (`libmp3lame`) for MP3 output; without it, `--mp3`
   recordings are kept as WAV files
 
 On Debian based distros, you can install these by running:
 ```bash
-sudo apt install multimon-ng libmp3lame0
+sudo apt install multimon-ng libsoxr0 libmp3lame0
 ```
 
-On Fedora, the LAME library is in the `lame-libs` package. You may have to
+On Fedora, the libraries are in the `soxr` and `lame-libs` packages. You may have to
 compile `multimon-ng` from source if you're using some other distro.
 
 ## Usage

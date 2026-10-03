@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import sys
 
 from .recorder import EASRecorder, RecorderSettings, validate_cli_settings
 
@@ -73,6 +74,10 @@ def main() -> None:
         EASRecorder(settings).run()
     except ValueError as exc:
         ap.error(str(exc))
+    except OSError as exc:
+        # A missing system tool or library (multimon-ng, libsoxr), or an unusable
+        # output directory.
+        sys.exit(f"easrecorder: {exc}")
 
 
 if __name__ == "__main__":
