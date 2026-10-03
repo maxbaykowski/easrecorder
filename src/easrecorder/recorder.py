@@ -13,7 +13,7 @@ import wave
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import BinaryIO, TextIO
+from typing import Any, BinaryIO, Callable, TextIO
 
 import lameenc
 import numpy as np
@@ -211,6 +211,10 @@ class EASRecorder:
     Use ``run()`` to read from a stream until EOF, or use ``start()``,
     ``write()``, and ``stop()`` when another Python component produces samples.
     Alert-scoped settings are snapshotted when a new SAME header starts.
+
+    ``on_alert``, if set, is called once for each alert after its recording is
+    saved on disk, with a dict holding the same fields as an alert index entry.
+    It may be called from a background thread when saving MP3 files.
     """
 
     def __init__(
@@ -219,8 +223,10 @@ class EASRecorder:
         input_stream: BinaryIO | None = None,
         output_stream: BinaryIO | None = None,
         log_stream: TextIO | None = None,
+        on_alert: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.settings = settings
+        self.on_alert = on_alert
         self.input_stream = input_stream if input_stream is not None else sys.stdin.buffer
         self.output_stream = output_stream if output_stream is not None else sys.stdout.buffer
         self.log_stream = log_stream if log_stream is not None else (
@@ -1004,7 +1010,7 @@ class EASRecorder:
         self._cur_path = None
         if alert.save_format != "mp3":
             self._set_output_timestamp(wav_path, header)
-            self._write_index_entry(alert, header, wav_path)
+            self._alert_saved(alert, header, wav_path)
             return
         t_mp3 = threading.Thread(
             target=self._convert_to_mp3,
@@ -1071,7 +1077,7 @@ class EASRecorder:
             self._set_output_timestamp(wav_path, header)
             self._log("[same] MP3 conversion failed; keeping WAV.")
         if alert is not None:
-            self._write_index_entry(alert, header, final_path)
+            self._alert_saved(alert, header, final_path)
 
     def _set_output_timestamp(self, output_path: str, header: SameHeader | None) -> None:
         if header is None:
@@ -1082,21 +1088,25 @@ class EASRecorder:
         except OSError as exc:
             self._log(f"[same] Timestamp update failed: {exc}")
 
-    def _write_index_entry(
-        self,
-        alert: _AlertSettings,
-        header: SameHeader | None,
-        output_path: str,
-    ) -> None:
-        if alert.index_path is None or header is None:
+    def _alert_saved(self, alert: _AlertSettings, header: SameHeader | None, output_path: str) -> None:
+        """Index the saved recording and tell the application about it."""
+
+        if header is None:
             return
-        index_path = alert.index_path
-        if not os.path.isabs(index_path):
-            index_path = os.path.join(alert.outdir, index_path)
-        index_path = os.path.abspath(index_path)
+        entry = self._alert_entry(header, output_path)
+        if alert.index_path is not None:
+            self._write_index_entry(alert, entry)
+        callback = self.on_alert
+        if callback is not None:
+            try:
+                callback(dict(entry, fips_codes=list(entry["fips_codes"])))
+            except Exception as exc:
+                self._log(f"[same] on_alert callback failed: {exc!r}")
+
+    def _alert_entry(self, header: SameHeader, output_path: str) -> dict[str, Any]:
         start_time = header.start_time_utc.astimezone(timezone.utc)
         expires_at = start_time + timedelta(seconds=header.duration_seconds)
-        entry = {
+        return {
             "raw_same_header": header.raw_header,
             "event_type": header.event_type,
             "originator": header.originator,
@@ -1108,6 +1118,14 @@ class EASRecorder:
             "sender_id": header.sender_id,
             "file_path": os.path.abspath(output_path),
         }
+
+    def _write_index_entry(self, alert: _AlertSettings, entry: dict[str, Any]) -> None:
+        index_path = alert.index_path
+        if index_path is None:
+            return
+        if not os.path.isabs(index_path):
+            index_path = os.path.join(alert.outdir, index_path)
+        index_path = os.path.abspath(index_path)
 
         with self._index_lock:
             try:

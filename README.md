@@ -116,6 +116,40 @@ The bytes passed to `write()` must be raw signed 16-bit little-endian mono PCM
 at `settings.rate`. `rate` and `detect_rate` configure the decoder pipeline
 when `start()` runs, so changing those requires restarting the recorder.
 
+### Alert notifications
+
+Pass `on_alert` to be told about each alert as soon as its recording has been
+saved on disk. The function receives a dict with the same fields as an
+[alert index](#alert-index) entry, whether or not the index is enabled:
+
+```python
+from easrecorder import EASRecorder, RecorderSettings
+
+def handle_alert(alert):
+    print(alert["event_type"], alert["fips_codes"], alert["file_path"])
+
+recorder = EASRecorder(RecorderSettings(rate=22050), on_alert=handle_alert)
+recorder.run()
+```
+
+`on_alert` is called once per alert, after the file (including any MP3
+conversion) is complete, so `file_path` is ready to use.
+
+`on_alert` can be set, changed or removed at any time while the recorder runs:
+
+```python
+recorder.on_alert = handle_alert   # start receiving alerts
+recorder.on_alert = None           # stop
+```
+
+The change applies to every alert that finishes saving afterwards, including
+one being converted to MP3 at that moment.
+
+When saving MP3 files, `on_alert` is called from a background thread; if your
+application isn't thread-safe, hand the alert to your own thread, for example
+with a `queue.Queue`. Exceptions raised by the function are logged and don't stop
+the recorder. Keep it quick, since slow work there delays the recorder.
+
 All command-line options are available through `RecorderSettings`:
 
 | CLI option | API setting |

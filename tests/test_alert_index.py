@@ -1,6 +1,7 @@
 import io
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -150,7 +151,7 @@ class AlertIndexTests(unittest.TestCase):
             parsed = parse_same_header(HEADER, year=2026)
             output_path = Path(tmp) / "alert.wav"
 
-            recorder._write_index_entry(alert, parsed, str(output_path))
+            recorder._alert_saved(alert, parsed, str(output_path))
 
             data = json.loads(index_path.read_text(encoding="utf-8"))
             self.assertEqual(data["version"], 1)
@@ -165,7 +166,7 @@ class AlertIndexTests(unittest.TestCase):
             settings = RecorderSettings(rate=22050, outdir=tmp, index_path="index.json")
             recorder = EASRecorder(settings, log_stream=io.StringIO())
 
-            recorder._write_index_entry(
+            recorder._alert_saved(
                 recorder.snapshot_alert_settings(),
                 parse_same_header(HEADER, year=2026),
                 str(Path(tmp) / "alert.wav"),
@@ -184,11 +185,144 @@ class AlertIndexTests(unittest.TestCase):
             disabled_alert = recorder.snapshot_alert_settings()
             parsed = parse_same_header(HEADER, year=2026)
 
-            recorder._write_index_entry(disabled_alert, parsed, str(Path(tmp) / "disabled.wav"))
+            recorder._alert_saved(disabled_alert, parsed, str(Path(tmp) / "disabled.wav"))
             self.assertFalse((Path(tmp) / "index.json").exists())
 
-            recorder._write_index_entry(enabled_alert, parsed, str(Path(tmp) / "enabled.wav"))
+            recorder._alert_saved(enabled_alert, parsed, str(Path(tmp) / "enabled.wav"))
             self.assertTrue((Path(tmp) / "index.json").exists())
+
+
+
+class AlertCallbackTests(unittest.TestCase):
+    def record_alert(self, recorder, header=HEADER):
+        recorder._lines.append(f"EAS: {header}")
+        recorder._process_decoded_lines()
+        recorder._write_alert_audio(b"\x00\x00" * 2205)
+        recorder._lines.extend(["EAS: NNNN"] * 3)
+        recorder._process_decoded_lines()
+        for conversion in recorder._mp3_threads:
+            conversion.join()
+
+    def test_callback_gets_the_index_entry_once_the_file_is_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            received = []
+
+            def on_alert(alert):
+                received.append(alert)
+                self.assertTrue(Path(alert["file_path"]).exists())
+
+            settings = RecorderSettings(rate=22050, outdir=tmp, year=2026, index_path="index.json")
+            recorder = EASRecorder(settings, log_stream=io.StringIO(), on_alert=on_alert)
+            self.record_alert(recorder)
+
+            index = json.loads((Path(tmp) / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(received, index["alerts"])
+
+    def test_callback_waits_for_mp3_conversion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            received = []
+
+            def on_alert(alert):
+                received.append(alert)
+                self.assertTrue(Path(alert["file_path"]).exists())
+                self.assertFalse(Path(alert["file_path"]).with_suffix(".wav").exists())
+
+            settings = RecorderSettings(rate=22050, outdir=tmp, year=2026, save_format="mp3")
+            recorder = EASRecorder(settings, log_stream=io.StringIO(), on_alert=on_alert)
+            self.record_alert(recorder)
+
+            self.assertEqual(len(received), 1)
+            self.assertEqual(Path(received[0]["file_path"]).suffix, ".mp3")
+
+    def test_callback_works_without_an_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            received = []
+            settings = RecorderSettings(rate=22050, outdir=tmp, year=2026)
+            recorder = EASRecorder(settings, log_stream=io.StringIO(), on_alert=received.append)
+            self.record_alert(recorder)
+
+            self.assertEqual(len(received), 1)
+            alert = received[0]
+            self.assertEqual(alert["raw_same_header"], HEADER)
+            self.assertEqual(alert["event_type"], "TOR")
+            self.assertEqual(alert["fips_codes"], ["039173", "039051", "139069"])
+            self.assertEqual(alert["start_time_utc"], "2026-06-08T18:29:00Z")
+            self.assertEqual(alert["expires_at_utc"], "2026-06-08T18:59:00Z")
+            self.assertEqual(list(Path(tmp).glob("*.json")), [])
+
+    def test_failing_callback_does_not_stop_recording(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+
+            def on_alert(alert):
+                calls.append(alert)
+                raise RuntimeError("application bug")
+
+            log = io.StringIO()
+            settings = RecorderSettings(rate=22050, outdir=tmp, year=2026, index_path="index.json")
+            recorder = EASRecorder(settings, log_stream=log, on_alert=on_alert)
+            self.record_alert(recorder)
+            self.record_alert(recorder, "ZCZC-WXR-SVR-039173+0030-1591830-KCLE/NWS-")
+
+            self.assertEqual(len(calls), 2)
+            self.assertIn("on_alert callback failed: RuntimeError('application bug')", log.getvalue())
+            index = json.loads((Path(tmp) / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(index["alerts"]), 2)
+
+    def test_callback_can_be_set_after_creating_the_recorder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            received = []
+            recorder = EASRecorder(RecorderSettings(rate=22050, outdir=tmp, year=2026), log_stream=io.StringIO())
+            recorder.on_alert = received.append
+            self.record_alert(recorder)
+
+            self.assertEqual(len(received), 1)
+
+
+    def test_callback_can_be_unset_and_set_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = [], []
+            recorder = EASRecorder(
+                RecorderSettings(rate=22050, outdir=tmp, year=2026),
+                log_stream=io.StringIO(),
+                on_alert=first.append,
+            )
+            self.record_alert(recorder)
+            recorder.on_alert = None
+            self.record_alert(recorder, "ZCZC-WXR-SVR-039173+0030-1591830-KCLE/NWS-")
+            recorder.on_alert = second.append
+            self.record_alert(recorder, "ZCZC-WXR-FFW-039173+0030-1591831-KCLE/NWS-")
+
+            self.assertEqual([alert["event_type"] for alert in first], ["TOR"])
+            self.assertEqual([alert["event_type"] for alert in second], ["FFW"])
+            self.assertEqual(len(list(Path(tmp).glob("*.wav"))), 3)
+
+    def test_unsetting_during_mp3_conversion_skips_that_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            received = []
+            settings = RecorderSettings(rate=22050, outdir=tmp, year=2026, save_format="mp3")
+            recorder = EASRecorder(settings, log_stream=io.StringIO(), on_alert=received.append)
+            # Hold the conversion thread just before it reports the alert.
+            unset_done = threading.Event()
+            set_timestamp = recorder._set_output_timestamp
+
+            def wait_then_set_timestamp(path, header):
+                unset_done.wait(timeout=10)
+                set_timestamp(path, header)
+
+            recorder._set_output_timestamp = wait_then_set_timestamp
+            recorder._lines.append(f"EAS: {HEADER}")
+            recorder._process_decoded_lines()
+            recorder._write_alert_audio(b"\x00\x00" * 2205)
+            recorder._lines.extend(["EAS: NNNN"] * 3)
+            recorder._process_decoded_lines()
+            recorder.on_alert = None
+            unset_done.set()
+            for conversion in recorder._mp3_threads:
+                conversion.join()
+
+            self.assertEqual(received, [])
+            self.assertEqual(len(list(Path(tmp).glob("*.mp3"))), 1)
 
 
 if __name__ == "__main__":
