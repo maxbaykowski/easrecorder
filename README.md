@@ -9,19 +9,22 @@ pip install .
 
 The package installs these Python dependencies automatically:
 
+- `numpy` for audio processing and SAME and attention tone detection
 - `soxr` for streaming sample-rate conversion
-- `lameenc` for optional MP3 encoding
 
-It requires one external tool at runtime:
+It also needs these from your system:
 
 - `multimon-ng` for decoding SAME headers
+- the LAME library (`libmp3lame`) for MP3 output; without it, `--mp3`
+  recordings are kept as WAV files
 
-On Debian based distros, you can install these dependencies by running:
+On Debian based distros, you can install these by running:
 ```bash
-sudo apt install multimon-ng
+sudo apt install multimon-ng libmp3lame0
 ```
 
-You may have to compile `multimon-ng` from source if you're using some other distro.
+On Fedora, the LAME library is in the `lame-libs` package. You may have to
+compile `multimon-ng` from source if you're using some other distro.
 
 ## Usage
 

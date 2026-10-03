@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import easrecorder.recorder as recorder_module
 from easrecorder import EASRecorder, RecorderSettings
+from easrecorder.mp3_encoder import Mp3EncoderError
 
 
 class _FakePipe:
@@ -77,6 +78,27 @@ class AudioBackendTests(unittest.TestCase):
             self.assertTrue(mp3_path.exists())
             self.assertGreater(mp3_path.stat().st_size, 0)
             self.assertFalse(wav_path.exists())
+
+    def test_missing_libmp3lame_keeps_the_wav_and_says_why(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = Path(tmp) / "alert.wav"
+            with wave.open(str(wav_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(22050)
+                output.writeframes(b"\x00\x00" * 22050)
+            log = io.StringIO()
+            recorder = EASRecorder(RecorderSettings(rate=22050), log_stream=log)
+
+            def missing(*args, **kwargs):
+                raise Mp3EncoderError("required shared library 'mp3lame' could not be loaded")
+
+            with patch.object(recorder_module, "Mp3Encoder", missing):
+                recorder._convert_to_mp3(str(wav_path))
+
+            self.assertTrue(wav_path.exists())
+            self.assertEqual(list(Path(tmp).glob("*.mp3*")), [])
+            self.assertIn("MP3 conversion failed (required shared library 'mp3lame' could not be loaded)", log.getvalue())
 
 
 if __name__ == "__main__":

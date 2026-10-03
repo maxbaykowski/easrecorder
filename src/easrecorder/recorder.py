@@ -15,11 +15,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, BinaryIO, Callable, TextIO
 
-import lameenc
 import numpy as np
 import soxr
 
 from .attention_tone_detector import ATTENTION_TONE_MIN_SECONDS, AttentionTone, AttentionToneTracker
+from .mp3_encoder import Mp3Encoder
 from .same_preamble_detector import SAME_BAUD, SameBurst, SamePreambleTracker
 
 
@@ -28,6 +28,7 @@ MAX_POSTRECORD_SECONDS = 10.0
 SAVE_FORMATS = {"wav", "mp3"}
 DECODER_DRAIN_TIMEOUT_SECONDS = 1.0
 MP3_SAMPLE_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
+MP3_BITRATE_KBPS = 192
 INDEX_VERSION = 1
 # How far back the first of the three header bursts can be when the decoder confirms
 # the header (normally after the second burst; after the third if one was garbled).
@@ -1033,12 +1034,6 @@ class EASRecorder:
             with wave.open(wav_path, "rb") as source:
                 source_rate = source.getframerate()
                 target_rate = min(MP3_SAMPLE_RATES, key=lambda rate: abs(rate - source_rate))
-                encoder = lameenc.Encoder()
-                encoder.set_bit_rate(192)
-                encoder.set_in_sample_rate(target_rate)
-                encoder.set_out_sample_rate(target_rate)
-                encoder.set_channels(1)
-                encoder.set_quality(2)
                 resampler = None
                 if source_rate != target_rate:
                     resampler = soxr.ResampleStream(
@@ -1048,7 +1043,7 @@ class EASRecorder:
                         dtype="int16",
                     )
 
-                with open(temp_mp3_path, "wb") as output:
+                with Mp3Encoder(target_rate, MP3_BITRATE_KBPS) as encoder, open(temp_mp3_path, "wb") as output:
                     while True:
                         pcm = source.readframes(8192)
                         if not pcm:
@@ -1069,13 +1064,13 @@ class EASRecorder:
             self._set_output_timestamp(mp3_path, header)
             os.remove(wav_path)
             self._log(f"[same] Writing: {mp3_path}")
-        except Exception:
+        except Exception as exc:
             try:
                 os.remove(temp_mp3_path)
             except OSError:
                 pass
             self._set_output_timestamp(wav_path, header)
-            self._log("[same] MP3 conversion failed; keeping WAV.")
+            self._log(f"[same] MP3 conversion failed ({exc}); keeping WAV.")
         if alert is not None:
             self._alert_saved(alert, header, final_path)
 

@@ -10,7 +10,7 @@ readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.9"
 dependencies = [
-  "lameenc>=1.8.2",
+  "numpy",
   "soxr>=1.1.0",
 ]
 authors = [
