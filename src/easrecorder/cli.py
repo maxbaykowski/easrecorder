@@ -14,7 +14,7 @@ def main() -> None:
         help="Rate to feed multimon-ng (Hz), default 22050 for EAS decoding",
     )
     ap.add_argument("--outdir", default=".", help="Where to write WAV files")
-    ap.add_argument("--max-seconds", type=int, default=120, help="Max record length (seconds)")
+    ap.add_argument("--max-seconds", type=int, default=120, help="Max seconds to record after the attention tone, or after the header if there is no tone")
     ap.add_argument("--prefix", help="Filename prefix")
     ap.add_argument("--mp3", action="store_true", help="Save recordings as MP3 (192 kbps CBR)")
     ap.add_argument("--local-time", action="store_true", help="Use system local time in filenames")

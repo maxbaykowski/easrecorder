@@ -41,9 +41,22 @@ detector misses it, the recorder estimates the start from the first header
 burst `multimon-ng` decoded. If fewer than three EOMs decode, the recording
 ends after the last one heard once no other arrives within 4 seconds.
 
+`--max-seconds` limits how long a recording runs. Like an ENDEC, the recorder
+listens for an attention tone after the headers: NOAA Weather Radio's 1050 Hz
+tone, or the 853 + 960 Hz EBS/EAS two-tone signal. If one starts within about
+6 seconds of the third header, the `--max-seconds` count starts when the tone
+ends, so a long tone doesn't use up recording time. Otherwise it starts at the
+header. Tones are recognized through background noise and slightly off
+frequency, but must last at least 2 seconds; voice, music and 1 kHz test tones
+are ignored.
+
 `--pre-seconds` adds audio before the first header and `--post-seconds` adds
-audio after the last EOM. `--reconstruct-same` replaces the received headers
-and EOMs with generated ones.
+audio after the last EOM.
+
+`--reconstruct-same` replaces the received headers and EOMs with generated
+ones. The live audio it keeps starts where the attention tone ends, or right
+after the third header if there is no tone, and runs until the first EOM
+begins. `--max-seconds` counts from the start of that live audio.
 
 When a new header arrives, the current recording ends where that header's
 first burst began and a new recording starts there:

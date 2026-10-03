@@ -19,6 +19,7 @@ import lameenc
 import numpy as np
 import soxr
 
+from .attention_tone_detector import ATTENTION_TONE_MIN_SECONDS, AttentionTone, AttentionToneTracker
 from .same_preamble_detector import SAME_BAUD, SameBurst, SamePreambleTracker
 
 
@@ -43,6 +44,12 @@ HEADER_MIN_BURST_SECONDS = 0.6
 # Alert audio reaches the file this long after it arrives, so that when a new header
 # is confirmed the file can still end where that header's first burst began.
 WRITE_DELAY_SECONDS = HEADER_LOOKBACK_SECONDS
+# An attention tone normally starts 2-4 s after the third header burst; one starting
+# later than this isn't treated as part of the alert.
+ATTENTION_TONE_WINDOW_SECONDS = 6.0
+# EAS attention tones last 8-25 s. If one runs longer, start max_seconds anyway.
+ATTENTION_TONE_MAX_SECONDS = 30.0
+ATTENTION_TONE_NAMES = {"nwr": "1050 Hz", "ebs": "853 + 960 Hz"}
 EOM_BURSTS = 3
 # If fewer than three EOMs decode, end at the last one once no other arrives in time.
 EOM_WAIT_SECONDS = 4.0
@@ -230,11 +237,7 @@ class EASRecorder:
         self._recording = False
         self._wav = None
         self._cur_path: str | None = None
-        self._rec_bytes = 0
         self._post_written = 0
-        self._capture_skip_bytes = 0
-        self._capture_live_audio = False
-        self._record_buf = bytearray()
         self._active_header: SameHeader | None = None
         self._decode_pace_start: float | None = None
         self._decode_pace_bytes = 0
@@ -252,6 +255,8 @@ class EASRecorder:
         self._detected_bytes = 0
         self._preamble_tracker = SamePreambleTracker(settings.rate)
         self._bursts: deque[SameBurst] = deque()
+        self._tone_tracker = AttentionToneTracker(settings.rate)
+        self._tones: deque[AttentionTone] = deque()
         self._clusters: deque[_HeaderCluster] = deque()
         self._committed = 0
         self._last_cut = 0
@@ -260,6 +265,15 @@ class EASRecorder:
         self._eoms_done = False
         self._eom_reason = "EOM"
         self._last_eom_pos: int | None = None
+        # Where the active alert's header was decoded and its first burst began, and
+        # the attention tone that followed it, once known (_tone_resolved).
+        self._trigger_pos = 0
+        self._header_start = 0
+        self._tone_deadline = 0
+        self._tone_resolved = False
+        self._tone_end: int | None = None
+        # Reconstruction mode: where live audio starts, once known.
+        self._capture_start: int | None = None
 
         self._bytes_per_second = settings.rate * 2
         self._history_max_bytes = int(
@@ -268,9 +282,6 @@ class EASRecorder:
         self._eom_wait_bytes = int(EOM_WAIT_SECONDS * self._bytes_per_second)
         self._write_delay_bytes = self._seconds_to_bytes(WRITE_DELAY_SECONDS)
         self._header_margin_bytes = self._seconds_to_bytes(HEADER_START_MARGIN_SECONDS)
-        self._capture_delay_seconds = 10.0
-        self._capture_delay_bytes = int(round(self._capture_delay_seconds * self._bytes_per_second))
-        self._trim_tail_bytes = self._bytes_per_second + 16000
         self._decode_pace_slack_seconds = 0.25
         self.chunk_bytes = max(4096, int(settings.rate * 0.1) * 2)
 
@@ -359,6 +370,7 @@ class EASRecorder:
             self._pace_reconstruction_decode(len(audio))
 
         self._detect_preambles(audio)
+        self._detect_attention_tones(audio)
         self._process_decoded_lines()
         self._write_alert_audio(audio)
 
@@ -369,14 +381,10 @@ class EASRecorder:
             self._drain_decoder()
         if self._recording:
             try:
-                alert = self._active_alert
-                if alert is not None and not alert.reconstruct_same:
-                    end = self._routed_bytes
-                    if self._last_eom_pos is not None:
-                        end = min(end, self._last_eom_pos + alert.post_bytes)
-                    self._stop_at(end, reason)
-                else:
-                    self._stop_record(reason)
+                end = self._routed_bytes
+                if self._active_alert is not None and self._last_eom_pos is not None:
+                    end = min(end, self._last_eom_pos + self._active_alert.post_bytes)
+                self._stop_at(end, reason)
             except Exception:
                 pass
         try:
@@ -496,7 +504,9 @@ class EASRecorder:
 
             if payload.startswith("NNNN") and self._recording:
                 if self._active_alert is not None and self._active_alert.reconstruct_same:
-                    self._stop_record("EOM", saw_eom=True)
+                    # Generated EOMs replace the received ones, so live audio ends
+                    # where the first EOM began.
+                    self._stop_at(self._eom_burst_start(), "EOM")
                 elif not self._eoms_done:
                     self._handle_eom()
 
@@ -542,14 +552,6 @@ class EASRecorder:
         alert = self._active_alert
         first_burst = self._first_header_burst(header_line)
         cut = self._routed_bytes if first_burst is None else first_burst[0] - self._header_margin_bytes
-        if alert is not None and alert.reconstruct_same:
-            # Live audio is gathered in _record_buf, which ends at _routed_bytes.
-            drop = max(0, min(len(self._record_buf), self._routed_bytes - cut))
-            drop -= drop % 2
-            if drop:
-                del self._record_buf[-drop:]
-            self._stop_record("interrupted by a new header")
-            return
         if self._last_eom_pos is not None:
             cut = min(cut, self._last_eom_pos + alert.post_bytes)
             reason = f"{self._eom_reason}, next alert followed"
@@ -570,9 +572,15 @@ class EASRecorder:
         alert = self._active_alert
         if alert is None:
             return
-        if alert.max_bytes > 0 and self._rec_bytes >= alert.max_bytes:
-            self._stop_at(self._routed_bytes, "timeout")
-            return
+        timer_start = self._alert_timer_start()
+        if alert.reconstruct_same and self._capture_start is None:
+            if timer_start is None:
+                return
+            self._begin_capture(timer_start)
+        if alert.max_bytes > 0 and timer_start is not None:
+            if self._routed_bytes >= timer_start + alert.max_bytes:
+                self._stop_at(timer_start + alert.max_bytes, "timeout")
+                return
         if self._last_eom_pos is None:
             return
         if not self._eoms_done:
@@ -591,6 +599,10 @@ class EASRecorder:
     def _stop_at(self, end: int, reason: str) -> None:
         """Write the alert up to stream position ``end`` and close it."""
 
+        alert = self._active_alert
+        if alert is not None and alert.reconstruct_same and self._capture_start is None:
+            # Ending before live capture was due to start; capture whatever is left.
+            self._begin_capture(min(end, self._alert_timer_start(force=True)))
         end = max(self._committed, min(end, self._routed_bytes))
         end -= end % 2
         self._commit(end)
@@ -613,6 +625,124 @@ class EASRecorder:
         self._bursts.extend(self._preamble_tracker.feed(audio))
         self._detected_bytes += len(audio)
 
+    def _detect_attention_tones(self, audio: bytes) -> None:
+        self._tones.extend(self._tone_tracker.feed(audio))
+
+    def _alert_timer_start(self, force: bool = False) -> int | None:
+        """Where max_seconds starts counting, or None while that isn't known yet.
+
+        That is the end of the attention tone if one follows the header. Otherwise it
+        is the decoded header, or in reconstruction mode, the end of the third header
+        burst, where live audio starts.
+        """
+
+        if not self._resolve_attention_tone(force):
+            return None
+        if self._tone_end is not None:
+            return self._tone_end
+        if self._active_alert is not None and self._active_alert.reconstruct_same:
+            return self._third_header_burst_end()
+        return self._trigger_pos
+
+    def _resolve_attention_tone(self, force: bool = False) -> bool:
+        """Decide whether an attention tone follows the header; True once decided.
+
+        With ``force``, decide now with what has been heard so far.
+        """
+
+        if self._tone_resolved:
+            return True
+        min_tone_bytes = self._seconds_to_bytes(ATTENTION_TONE_MIN_SECONDS)
+        max_tone_bytes = self._seconds_to_bytes(ATTENTION_TONE_MAX_SECONDS)
+        tone = next(
+            (
+                tone
+                for tone in self._tones
+                if self._header_start <= tone.start * 2 <= self._tone_deadline
+            ),
+            None,
+        )
+        if tone is None:
+            # A tone is only reported once it has lasted the minimum, so wait that
+            # long past the deadline before deciding there is none.
+            if not force and self._detected_bytes < self._tone_deadline + min_tone_bytes:
+                return False
+            self._log("[same] No attention tone after the header")
+            self._tone_resolved = True
+            return True
+        start = tone.start * 2
+        if tone.end is not None:
+            end = tone.end * 2
+        elif self._detected_bytes - start >= max_tone_bytes:
+            end = start + max_tone_bytes
+        elif force:
+            end = self._detected_bytes
+        else:
+            return False
+        self._log(
+            f"[same] Attention tone {ATTENTION_TONE_NAMES[tone.kind]} lasted "
+            f"{(end - start) / self._bytes_per_second:.1f}s"
+        )
+        self._tone_resolved = True
+        self._tone_end = end
+        return True
+
+    def _third_header_burst_end(self) -> int:
+        header_line = self._active_header.raw_header if self._active_header is not None else ""
+        burst_bytes = self._burst_bytes(header_line)
+        latest_start = self._trigger_pos + burst_bytes + self._seconds_to_bytes(HEADER_BURST_GAP_SECONDS)
+        min_bytes = self._seconds_to_bytes(HEADER_MIN_BURST_SECONDS)
+        ends = []
+        for burst in self._bursts:
+            start, end = self._burst_span(burst)
+            if self._header_start <= start <= latest_start and end is not None and end - start >= min_bytes:
+                ends.append(end)
+        if ends:
+            return max(ends)
+        # Not detected: the header is normally decoded right after its second burst,
+        # and the third follows after a one second gap.
+        return self._trigger_pos + burst_bytes + self._seconds_to_bytes(1.0)
+
+    def _eom_burst_start(self) -> int:
+        """Cut position for the EOM burst that was just decoded."""
+
+        floor = self._capture_start if self._capture_start is not None else self._header_start
+        eom_bytes = self._burst_bytes("NNNN")
+        recent = self._routed_bytes - eom_bytes - self._seconds_to_bytes(2.0)
+        for burst in reversed(self._bursts):
+            start, _ = self._burst_span(burst)
+            if start < max(floor, recent):
+                break
+            if start <= self._routed_bytes:
+                return start - self._header_margin_bytes
+        return self._routed_bytes - eom_bytes - self._seconds_to_bytes(PARTIAL_DECODE_MARGIN_SECONDS)
+
+    def _begin_capture(self, start: int) -> None:
+        start = max(start, self._history_start)
+        start -= start % 2
+        self._capture_start = start
+        self._committed = start
+        self._log("[same] Capturing alert audio")
+
+    def _begin_alert_timing(self, header_line: str, header_start: int) -> None:
+        self._trigger_pos = self._routed_bytes
+        self._header_start = header_start
+        self._tone_resolved = False
+        self._tone_end = None
+        self._capture_start = None
+        # The third burst ends about one burst and gap after the header is confirmed.
+        self._tone_deadline = (
+            self._routed_bytes
+            + self._burst_bytes(header_line)
+            + self._seconds_to_bytes(1.0 + ATTENTION_TONE_WINDOW_SECONDS)
+        )
+        # This alert's own later header bursts must not be taken for a new alert.
+        self._alert_floor = (
+            self._routed_bytes
+            + self._burst_bytes(header_line)
+            + self._seconds_to_bytes(HEADER_BURST_GAP_SECONDS)
+        )
+
     def _append_history(self, audio: bytes) -> None:
         self._history.extend(audio)
         excess = len(self._history) - self._history_max_bytes
@@ -623,6 +753,8 @@ class EASRecorder:
             self._history_start += excess
             while self._bursts and self._bursts[0].start * 2 < self._history_start:
                 self._bursts.popleft()
+            while self._tones and self._tones[0].end is not None and self._tones[0].end * 2 < self._history_start:
+                self._tones.popleft()
             while self._clusters and self._clusters[0].positions[-1] < self._history_start:
                 self._clusters.popleft()
 
@@ -633,6 +765,8 @@ class EASRecorder:
         self._detected_bytes = 0
         self._preamble_tracker = SamePreambleTracker(self.settings.rate)
         self._bursts.clear()
+        self._tone_tracker = AttentionToneTracker(self.settings.rate)
+        self._tones.clear()
         self._clusters.clear()
         self._committed = 0
         self._last_cut = 0
@@ -709,27 +843,12 @@ class EASRecorder:
         self._append_history(audio)
         if not self._recording or self._wav is None or self._active_alert is None:
             return
-        if self._active_alert.reconstruct_same:
-            if not self._capture_live_audio:
-                if self._capture_skip_bytes >= len(audio):
-                    self._capture_skip_bytes -= len(audio)
-                    audio = b""
-                else:
-                    if self._capture_skip_bytes > 0:
-                        audio = audio[self._capture_skip_bytes:]
-                        self._capture_skip_bytes = 0
-                    self._capture_live_audio = True
-                    self._log("[same] Capturing alert audio")
-            if self._capture_live_audio and audio:
-                self._record_buf.extend(audio)
-                self._rec_bytes += len(audio)
-                if self._active_alert.max_bytes > 0 and self._rec_bytes >= self._active_alert.max_bytes:
-                    self._stop_record("timeout")
-            return
-        self._rec_bytes += len(audio)
         self._check_alert_end()
-        if self._recording:
-            self._commit(self._routed_bytes - self._write_delay_bytes)
+        if not self._recording:
+            return
+        if self._active_alert.reconstruct_same and self._capture_start is None:
+            return
+        self._commit(self._routed_bytes - self._write_delay_bytes)
 
     def _pace_reconstruction_decode(self, byte_count: int) -> None:
         if self._decode_pace_start is None:
@@ -795,7 +914,6 @@ class EASRecorder:
         self._active_header = parse_same_header(header_line, year=self._active_alert.name_year)
         self._wav = self._open_output_wav(header_line, self._active_alert)
         self._recording = True
-        self._rec_bytes = 0
         self._post_written = 0
         self._eom_count = 0
         self._eoms_done = False
@@ -811,15 +929,11 @@ class EASRecorder:
             self._log(f"[same] First header burst found by {first_burst[1]}")
         else:
             self._log("[same] First header burst not found; starting at the decoded header")
+        header_start = start
         start = max(start - self._active_alert.pre_bytes, self._header_floor())
         start -= start % 2
         self._committed = start
-        # This alert's own later header bursts must not be taken for a new alert.
-        self._alert_floor = (
-            self._routed_bytes
-            + self._burst_bytes(header_line)
-            + self._seconds_to_bytes(HEADER_BURST_GAP_SECONDS)
-        )
+        self._begin_alert_timing(header_line, header_start)
         prepend = self._routed_bytes - start
         if prepend > 0:
             self._log(f"[same] Prepend: {prepend} bytes (~{prepend / self._bytes_per_second:.2f}s)")
@@ -829,32 +943,20 @@ class EASRecorder:
         self._active_header = parse_same_header(header_line, year=self._active_alert.name_year)
         self._wav = self._open_output_wav(header_line, self._active_alert)
         self._recording = True
-        self._rec_bytes = 0
         self._post_written = 0
-        self._capture_skip_bytes = self._capture_delay_bytes
-        self._capture_live_audio = False
-        self._record_buf = bytearray()
         self._decode_pace_start = time.monotonic()
         self._decode_pace_bytes = 0
-        self._alert_floor = (
-            self._routed_bytes
-            + self._burst_bytes(header_line)
-            + self._seconds_to_bytes(HEADER_BURST_GAP_SECONDS)
-        )
+        first_burst = self._first_header_burst(header_line)
+        header_start = self._routed_bytes if first_burst is None else first_burst[0]
+        self._begin_alert_timing(header_line, header_start)
         self._wav.writeframes(self._reconstructed_prefix_bytes(header_line, self._active_alert))
-        self._log(f"[same] Reconstructing SAME header, live capture begins in {self._capture_delay_seconds:.0f}s")
+        self._log("[same] Reconstructing SAME header; live audio starts after the attention tone or third header")
 
-    def _stop_record(self, reason: str, saw_eom: bool = False) -> None:
+    def _stop_record(self, reason: str) -> None:
         alert = self._active_alert
         header = self._active_header
         if alert is not None and alert.reconstruct_same and self._wav is not None:
-            trim_bytes = 0
-            if saw_eom and self._record_buf:
-                trim_bytes = min(len(self._record_buf), self._trim_tail_bytes)
-            live_audio = bytes(self._record_buf[:-trim_bytes] if trim_bytes else self._record_buf)
             try:
-                if live_audio:
-                    self._wav.writeframes(live_audio)
                 self._wav.writeframes(self._reconstructed_suffix_bytes())
                 self._wav.close()
             except Exception:
@@ -865,15 +967,10 @@ class EASRecorder:
             self._wav = None
             self._recording = False
             self._alert_floor = 0
-            self._capture_skip_bytes = 0
-            self._capture_live_audio = False
-            self._record_buf = bytearray()
+            self._capture_start = None
             self._decode_pace_start = None
             self._decode_pace_bytes = 0
             self._log(f"[same] STOP: {reason}")
-            if trim_bytes > 0:
-                trim_seconds_actual = trim_bytes / self._bytes_per_second
-                self._log(f"[same] Trimmed: {trim_bytes} bytes (~{trim_seconds_actual:.2f}s)")
             self._finalize_output(alert, header)
             self._active_alert = None
             self._active_header = None
